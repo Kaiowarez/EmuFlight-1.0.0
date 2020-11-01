@@ -23,7 +23,6 @@
 #include "common/axis.h"
 #include "common/filter.h"
 #include "common/time.h"
-#include "common/dynlpf2.h"
 
 #include "drivers/accgyro/accgyro.h"
 #include "drivers/bus.h"
@@ -48,6 +47,17 @@ typedef union gyroLowpassFilter_u {
     pt1Filter_t pt1FilterState;
     biquadFilter_t biquadFilterState;
 } gyroLowpassFilter_t;
+
+#if defined(USE_GYRO_IMUF9001)
+typedef enum {
+    IMUF_RATE_32K = 0,
+    IMUF_RATE_16K = 1,
+    IMUF_RATE_8K = 2,
+    IMUF_RATE_4K = 3,
+    IMUF_RATE_2K = 4,
+    IMUF_RATE_1K = 5
+} imufRate_e;
+#endif
 
 typedef enum gyroDetectionFlags_e {
     GYRO_NONE_MASK = 0,
@@ -77,6 +87,9 @@ typedef struct gyro_s {
     float scale;
     float gyroADC[XYZ_AXIS_COUNT];     // aligned, calibrated, scaled, but unfiltered data from the sensor(s)
     float gyroADCf[XYZ_AXIS_COUNT];    // filtered gyro data
+    uint8_t sampleCount;               // gyro sensor sample counter
+    float sampleSum[XYZ_AXIS_COUNT];   // summed samples used for downsampling
+    bool downsampleFilterEnabled;      // if true then downsample using gyro lowpass 2, otherwise use averaging
 
     gyroSensor_t gyroSensor1;
 #ifdef USE_MULTI_GYRO
@@ -103,9 +116,8 @@ typedef struct gyro_s {
     filterApplyFnPtr notchFilterDynApplyFn;
     biquadFilter_t notchFilterDyn[XYZ_AXIS_COUNT][XYZ_AXIS_COUNT];
 
-    dynlpf2_t dynLpfGyro[XYZ_AXIS_COUNT];
 #ifdef USE_GYRO_DATA_ANALYSE
-    fftAnalyseState_t fftAnalyseState;
+    gyroAnalyseState_t gyroAnalyseState;
     float dynNotchQ;
 #endif
 
@@ -120,7 +132,6 @@ typedef struct gyro_s {
     uint8_t dynLpfFilter;
     uint16_t dynLpfMin;
     uint16_t dynLpfMax;
-    uint8_t dynLpfCurveExpo;
 #endif
 
 #ifdef USE_GYRO_OVERFLOW_CHECK
@@ -160,8 +171,12 @@ enum {
 };
 
 typedef struct gyroConfig_s {
+  uint8_t  gyro_align;                       // gyro alignment
+  uint8_t  gyro_sync_denom;                  // Gyro sample divider
+
     uint8_t  gyroMovementCalibrationThreshold; // people keep forgetting that moving model while init results in wrong gyro offsets. and then they never reset gyro. so this is now on by default.
     uint8_t  gyro_hardware_lpf;                // gyro DLPF setting
+    uint8_t  gyro_32khz_hardware_lpf;          // gyro 32khz DLPF setting
 
     uint8_t  gyro_high_fsr;
     uint8_t  gyro_use_32khz;
@@ -190,44 +205,36 @@ typedef struct gyroConfig_s {
     uint16_t dyn_lpf_gyro_max_hz;
 
     uint16_t dyn_notch_max_hz;
-    uint16_t dyn_notch_q;
+    uint8_t  dyn_notch_q;
     uint16_t dyn_notch_min_hz;
 
-#if defined(USE_GYRO_IMUF9001)
-    uint16_t imuf_mode;
-    uint16_t imuf_rate;
-    uint16_t imuf_pitch_lpf_cutoff_hz;
-    uint16_t imuf_roll_lpf_cutoff_hz;
-    uint16_t imuf_yaw_lpf_cutoff_hz;
-    uint16_t imuf_acc_lpf_cutoff_hz;
-#endif
-    uint16_t imuf_pitch_q;
-    uint16_t imuf_roll_q;
-    uint16_t imuf_yaw_q;
-    uint16_t imuf_w;
-    uint16_t imuf_sharpness;
-#ifdef USE_DYN_LPF2
-    uint16_t dynlpf2_fmin;
-    uint16_t dynlpf2_fmax;
-    uint16_t dynlpf2_gain;
-    uint16_t dynlpf2_fc_fc;
-    uint16_t dynlpf2_center_threshold;
-    uint16_t dynlpf2_throttle_threshold;
-    uint16_t dynlpf2_throttle_gain;
-    uint8_t  dynlpf2_enable;
-    uint8_t  dynlpf2_type;
-    uint8_t  dynlpf2_debug;
-#endif
+    #if defined(USE_GYRO_IMUF9001)
+        uint16_t imuf_mode;
+        uint16_t imuf_rate;
+        uint16_t imuf_pitch_lpf_cutoff_hz;
+        uint16_t imuf_roll_lpf_cutoff_hz;
+        uint16_t imuf_yaw_lpf_cutoff_hz;
+        uint16_t imuf_acc_lpf_cutoff_hz;
+    #endif
+        uint16_t imuf_pitch_q;
+        uint16_t imuf_roll_q;
+        uint16_t imuf_yaw_q;
+        uint16_t imuf_w;
+        uint16_t imuf_sharpness;
 
     uint8_t  gyro_filter_debug_axis;
 
     uint8_t gyrosDetected; // What gyros should detection be attempted for on startup. Automatically set on first startup.
-    uint8_t dyn_lpf_curve_expo; // set the curve for dynamic gyro lowpass filter
+
 } gyroConfig_t;
 
 PG_DECLARE(gyroConfig_t, gyroConfig);
 
 void gyroUpdate(void);
+#ifdef USE_DMA_SPI_DEVICE
+void gyroDmaSpiFinishRead(void);
+void gyroDmaSpiStartRead(void);
+#endif
 void gyroFiltering(timeUs_t currentTimeUs);
 bool gyroGetAccumulationAverage(float *accumulation);
 void gyroStartCalibration(bool isFirstArmingCalibration);
